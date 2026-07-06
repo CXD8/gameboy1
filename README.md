@@ -67,3 +67,5 @@ This project uses ESP-NOW peer-to-peer communication**, allowing devices to conn
 - Using ESP-IDF:
   - doom.py flash monitor
   - Or compile and upload using Arduino IDE.
+
+Made in Shenzhen, China - 2026

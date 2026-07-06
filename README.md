@@ -3,6 +3,8 @@
 A communist handheld gaming console based on the ESP-32 S3 capable of running multiplayer DOOM.
 ---
 
+!['zine page](./Mao%20Boy.png)
+
 ## Features
 - Peer-to-peer multiplayer
 - Battery-powered handheld design
@@ -56,7 +58,7 @@ This project uses ESP-NOW peer-to-peer communication**, allowing devices to conn
   - Or compile and upload using Arduino IDE.
  
 Schematic:
-![hello](https://github.com/CXD8/maoboy/blob/9ca12f91cbd775e934fe2102c3f903c8df88f165/Schematic/Schematic.png)
+![hello](./Schematic/Schematic.png)
 
 With love,
 Peter the eel

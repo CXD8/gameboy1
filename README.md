@@ -1,18 +1,14 @@
-# ESP32-S3 XIAO Handheld Doom (Peer-to-Peer Multiplayer)
+# Mao Boy
 
-Game Boy–style handheld gaming device built on the Seeed Studio XIAO ESP32-S3 running a lightweight port of [ESP32-DOOM, a port of PrBoom to the ESP32
-]([https://google.com](https://github.com/espressif/esp32-doom)) with **peer-to-peer multiplayer over ESP-NOW**.
-
-
+A communist handheld gaming console based on the ESP-32 S3 capable of running multiplayer DOOM.
 ---
 
 ## Features
-
 - Peer-to-peer multiplayer
 - Battery-powered handheld design
 - Joystick w/ click controls
 - 1.8" TFT display support (SPI-based)
-- Low-latency ESP-NOW networking
+- Low-latency ESP-NOW networkin
 
 ---
 
@@ -25,13 +21,10 @@ Game Boy–style handheld gaming device built on the Seeed Studio XIAO ESP32-S3 
 - 1.8" SPI
 
 ### Controls
-- Joystick with click
-
+- Joystick
 
 ### Power
-- 3.7V LiPo battery
-- TP4056 charging module (or built-in charging board)
-- Power switch
+- Standard 5V 10000mAh power bank
 
 ---
 
@@ -47,15 +40,9 @@ This project uses ESP-NOW peer-to-peer communication**, allowing devices to conn
   - game events
 - No central server required
 - Auto-discovery pairing mode supported
-
----
-
-## Software Stack
-
-- ESP-IDF / Arduino framework (ESP32-S3)
-- ESP-NOW networking layer
 - Framebuffer optimized rendering pipeline
 - Custom input handler
+  
 
 ---
 
@@ -67,5 +54,7 @@ This project uses ESP-NOW peer-to-peer communication**, allowing devices to conn
 - Using ESP-IDF:
   - doom.py flash monitor
   - Or compile and upload using Arduino IDE.
+ 
 
-Made in Shenzhen, China - 2026
+With love,
+Peter the eel

@@ -1,0 +1,756 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h> 
+
+#if __has_include(<esp_arduino_version.h>)
+#include <esp_arduino_version.h>
+#endif
+
+#define SCREEN_W       160  
+#define SCREEN_H       128  
+
+#define GRID_CELL_SIZE 9
+#define MY_GRID_X      4    
+#define MY_GRID_Y      20   
+#define ENEMY_GRID_X   84   
+#define ENEMY_GRID_Y   20
+// ================================================================
+
+#ifndef D0
+#define D0 1
+#endif
+#ifndef D1
+#define D1 2
+#endif
+#ifndef D3
+#define D3 4
+#endif
+#ifndef D5
+#define D5 6
+#endif
+#ifndef D6
+#define D6 43
+#endif
+#ifndef D7
+#define D7 44
+#endif
+
+#define TFT_CS         D7
+#define TFT_DC         D6
+#define TFT_RST        D5
+#define TFT_ROTATION   1     
+
+#define INVERT_COLORS  false 
+
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+GFXcanvas16 canvas(SCREEN_W, SCREEN_H); 
+
+inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
+  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+#define C_BLACK       0x0000
+#define C_WHITE       0xFFFF
+#define C_RED         0xF800
+#define C_GREEN       0x07E0
+#define C_CYAN        0x07FF
+#define C_YELLOW      0xFFE0
+#define C_ORANGE      0xFD20
+#define C_LIGHTGREY   0xC618
+
+#define BTN_NONE        0
+#define BTN_SHORT_CLICK 1
+#define BTN_LONG_PRESS  2
+
+// --- GAME LOGIC DEFINITIONS ---
+enum GameState { STATE_MENU, STATE_PAIRING, STATE_PLACE_SHIPS, STATE_WAITING_OPPONENT, STATE_GAME_PLAY, STATE_GAME_OVER };
+enum PlaySubState { MY_TURN, WAIT_RESULT, WAIT_TURN };
+enum MsgType { MSG_PAIR_REQ, MSG_PAIR_ACK, MSG_READY, MSG_GAME_START, MSG_FIRE, MSG_FIRE_RESULT, MSG_RESET };
+
+struct GamePacket {
+  uint8_t type; 
+  uint8_t x;    
+  uint8_t y;    
+  uint8_t result; 
+  uint8_t seqNum; // Used to prevent desyncs from duplicated/dropped packets
+};
+
+struct Ship {
+  uint8_t length;
+  uint8_t x;
+  uint8_t y;
+  bool horizontal;
+  bool placed;
+};
+
+// --- GLOBAL VARIABLES ---
+GameState gameState = STATE_MENU;
+PlaySubState playSubState = WAIT_TURN;
+
+// Host / Client Roles
+bool isHost = false;
+bool isHosting = false; 
+
+uint8_t myGrid[8][8] = {0};
+uint8_t opponentGrid[8][8] = {0};
+
+Ship myShips[3] = {
+  {4, 0, 0, true, false}, // Cruiser
+  {3, 0, 0, true, false}, // Destroyer
+  {2, 0, 0, true, false}  // Patrol Boat
+};
+
+uint8_t currentShipToPlace = 0;
+bool opponentReady = false;
+int opponentShipsSunkCount = 0;
+bool isWinner = false;
+
+uint8_t placementX = 0, placementY = 0;
+bool placementHorizontal = true;
+uint8_t targetX = 0, targetY = 0;
+
+// Network Synchronization Tracker
+uint8_t myShotID = 1;
+uint8_t lastOpponentShotID = 0;
+uint8_t lastOpponentShotResult = 0;
+
+unsigned long lastJoyMove = 0;
+int joyMoveCooldown = 350; 
+int moveX = 0, moveY = 0;
+int centerX = 2048, centerY = 2048;
+const int deadzone = 800; 
+
+unsigned long popupEndTime = 0;
+String popupText = "";
+uint16_t popupColor = C_WHITE;
+uint8_t opponentMAC[6] = {0};
+bool peerAdded = false;
+const uint8_t broadcastMAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+unsigned long lastNetworkSend = 0;
+unsigned long shotSentTime = 0;
+
+// --- FORWARD DECLARATIONS ---
+void resetGame();
+void showPopup(String text, uint16_t color, unsigned long duration);
+bool isValidPlacement(uint8_t shipIdx, uint8_t x, uint8_t y, bool horizontal);
+void placeShip(uint8_t shipIdx, uint8_t x, uint8_t y, bool horizontal);
+bool isShipSunk(uint8_t shipIdx);
+bool areAllMyShipsSunk();
+uint8_t getMySunkCount();
+void addSpecificPeer(const uint8_t *mac);
+void drawScreen();
+uint8_t getButtonEvent();
+void calibrateJoystick();
+
+// --- ESP-NOW CALLBACKS ---
+#if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  const uint8_t *mac = info->src_addr;
+#else
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+#endif
+  if (len < sizeof(GamePacket)) return;
+  GamePacket packet;
+  memcpy(&packet, incomingData, sizeof(GamePacket));
+
+  if (packet.type == MSG_PAIR_REQ) {
+    if (gameState == STATE_PAIRING && !isHosting) {
+      memcpy(opponentMAC, mac, 6);
+      addSpecificPeer(opponentMAC);
+      GamePacket ack; ack.type = MSG_PAIR_ACK;
+      esp_now_send(opponentMAC, (uint8_t*)&ack, sizeof(GamePacket));
+      isHost = false; 
+      showPopup("CONNECTED AS JOINER", C_GREEN, 1500);
+      gameState = STATE_PLACE_SHIPS;
+    }
+  }
+  else if (packet.type == MSG_PAIR_ACK) {
+    if (gameState == STATE_PAIRING && isHosting) {
+      memcpy(opponentMAC, mac, 6);
+      addSpecificPeer(opponentMAC);
+      isHost = true;
+      showPopup("CONNECTED AS HOST", C_GREEN, 1500);
+      gameState = STATE_PLACE_SHIPS;
+    }
+  }
+  else if (packet.type == MSG_READY) {
+    opponentReady = true;
+    if (gameState == STATE_WAITING_OPPONENT && isHost) {
+      GamePacket startPkt; startPkt.type = MSG_GAME_START;
+      esp_now_send(opponentMAC, (uint8_t*)&startPkt, sizeof(GamePacket));
+      gameState = STATE_GAME_PLAY; playSubState = MY_TURN;
+      showPopup("GAME ON! YOUR TURN", C_GREEN, 2000);
+    } 
+    else if (gameState == STATE_GAME_PLAY && isHost) {
+      // If client dropped MSG_GAME_START, they will re-send MSG_READY. Resend start packet!
+      GamePacket startPkt; startPkt.type = MSG_GAME_START;
+      esp_now_send(opponentMAC, (uint8_t*)&startPkt, sizeof(GamePacket));
+    }
+  }
+  else if (packet.type == MSG_GAME_START) {
+    if (gameState == STATE_WAITING_OPPONENT && !isHost) {
+      gameState = STATE_GAME_PLAY; playSubState = WAIT_TURN;
+      showPopup("GAME ON! ENEMY TURN", C_ORANGE, 2000);
+    }
+  }
+  else if (packet.type == MSG_FIRE) {
+    // Failsafe: if client missed MSG_GAME_START but receives FIRE, immediately enter game.
+    if (gameState == STATE_WAITING_OPPONENT && !isHost) {
+      gameState = STATE_GAME_PLAY; playSubState = WAIT_TURN;
+    }
+
+    if (gameState == STATE_GAME_PLAY) {
+      GamePacket reply; reply.type = MSG_FIRE_RESULT; 
+      reply.x = packet.x; reply.y = packet.y; reply.seqNum = packet.seqNum;
+
+      // Anti-Desync: Check if this is a dropped-packet duplicate retry
+      if (packet.seqNum == lastOpponentShotID) {
+        reply.result = lastOpponentShotResult;
+        esp_now_send(opponentMAC, (uint8_t*)&reply, sizeof(GamePacket));
+      } 
+      else if (playSubState == WAIT_TURN) {
+        uint8_t fx = packet.x; uint8_t fy = packet.y;
+        uint8_t res = 0;
+
+        if (myGrid[fy][fx] >= 1 && myGrid[fy][fx] <= 3) {
+          uint8_t shipIdx = myGrid[fy][fx] - 1;
+          myGrid[fy][fx] = 10; 
+          
+          if (isShipSunk(shipIdx)) {
+            if (areAllMyShipsSunk()) res = 3; // Defeat
+            else res = 2; // Sunk
+          } else {
+            res = 1; // Hit
+          }
+        } else {
+          myGrid[fy][fx] = 11; res = 0; // Miss
+        }
+
+        lastOpponentShotID = packet.seqNum;
+        lastOpponentShotResult = res;
+        reply.result = res;
+        
+        esp_now_send(opponentMAC, (uint8_t*)&reply, sizeof(GamePacket));
+
+        if (res == 3) {
+          showPopup("DEFEAT!", C_RED, 3000);
+          gameState = STATE_GAME_OVER; isWinner = false;
+        } else {
+          showPopup(res > 0 ? "HIT!" : "MISS", res > 0 ? C_RED : C_WHITE, 1500);
+          playSubState = MY_TURN;
+        }
+      }
+    }
+  }
+  else if (packet.type == MSG_FIRE_RESULT) {
+    if (gameState == STATE_GAME_PLAY && playSubState == WAIT_RESULT) {
+      if (packet.seqNum == myShotID) { // Verify it's the answer to our current shot
+        uint8_t fx = packet.x; uint8_t fy = packet.y; uint8_t res = packet.result;
+
+        if (res == 0) {
+          opponentGrid[fy][fx] = 1; showPopup("MISS", C_WHITE, 1500); playSubState = WAIT_TURN;
+        } else if (res == 1) {
+          opponentGrid[fy][fx] = 2; showPopup("HIT!", C_RED, 1500); playSubState = WAIT_TURN;
+        } else if (res == 2) {
+          opponentGrid[fy][fx] = 3; opponentShipsSunkCount++;
+          showPopup("ENEMY SUNK!", C_GREEN, 2000); playSubState = WAIT_TURN;
+        } else if (res == 3) {
+          opponentGrid[fy][fx] = 3; opponentShipsSunkCount = 3;
+          showPopup("VICTORY!", C_GREEN, 3000); gameState = STATE_GAME_OVER; isWinner = true;
+        }
+      }
+    }
+  }
+  else if (packet.type == MSG_RESET) resetGame();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(D3, INPUT_PULLUP);
+
+  calibrateJoystick();
+
+  tft.initR(INITR_BLACKTAB); 
+  tft.setRotation(TFT_ROTATION);
+  tft.invertDisplay(INVERT_COLORS);
+  tft.fillScreen(C_BLACK);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    canvas.setTextSize(1); canvas.setTextColor(C_RED); canvas.setCursor(10, 20);
+    canvas.print("ESP-NOW Error");
+    tft.drawRGBBitmap(0, 0, canvas.getBuffer(), SCREEN_W, SCREEN_H);
+    while (1);
+  }
+
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, broadcastMAC, 6);
+  peerInfo.channel = 1;  
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+
+  esp_now_register_recv_cb(OnDataRecv);
+  resetGame();
+}
+
+void calibrateJoystick() {
+  long sumX = 0; long sumY = 0;
+  const int samples = 50;
+  for (int i = 0; i < samples; i++) {
+    sumX += analogRead(D0);
+    sumY += analogRead(D1);
+    delay(5);
+  }
+  centerX = sumX / samples; centerY = sumY / samples;
+}
+
+void readJoystick() {
+  int vrx = analogRead(D0);
+  int vry = analogRead(D1);
+  moveX = 0; moveY = 0;
+
+  bool movingX = (abs(vrx - centerX) > deadzone);
+  bool movingY = (abs(vry - centerY) > deadzone);
+
+  if (movingX || movingY) {
+    if (lastJoyMove == 0 || millis() - lastJoyMove > joyMoveCooldown) {
+      if (vrx < centerX - deadzone) moveX = -1;
+      else if (vrx > centerX + deadzone) moveX = 1;
+
+      if (vry < centerY - deadzone) moveY = -1;
+      else if (vry > centerY + deadzone) moveY = 1;
+
+      lastJoyMove = millis();
+      joyMoveCooldown = 150; 
+    }
+  } else {
+    lastJoyMove = 0;       
+    joyMoveCooldown = 350; 
+  }
+}
+
+uint8_t getButtonEvent() {
+  static bool stableState = HIGH;
+  static bool lastRawState = HIGH;
+  static unsigned long lastDebounceTime = 0;
+  static unsigned long pressStartTime = 0;
+  static bool longPressTriggered = false;
+  
+  bool rawState = digitalRead(D3);
+  uint8_t event = BTN_NONE;
+
+  if (rawState != lastRawState) lastDebounceTime = millis(); 
+  
+  if ((millis() - lastDebounceTime) > 30) { 
+    if (rawState != stableState) {
+      stableState = rawState;
+      if (stableState == LOW) {
+        pressStartTime = millis();
+        longPressTriggered = false;
+      } else {
+        if (!longPressTriggered && (millis() - pressStartTime > 20)) {
+          event = BTN_SHORT_CLICK;
+        }
+      }
+    }
+  }
+  
+  if (stableState == LOW && !longPressTriggered) { 
+    if (millis() - pressStartTime >= 600) {
+      longPressTriggered = true;
+      event = BTN_LONG_PRESS;
+    }
+  }
+  
+  lastRawState = rawState;
+  return event;
+}
+
+void loop() {
+  readJoystick();
+  uint8_t btn = getButtonEvent();
+
+  switch (gameState) {
+    case STATE_MENU:
+      if (btn == BTN_SHORT_CLICK) {
+        isHosting = false; gameState = STATE_PAIRING;
+      } else if (btn == BTN_LONG_PRESS) {
+        isHosting = true; gameState = STATE_PAIRING; lastNetworkSend = 0;
+      }
+      break;
+
+    case STATE_PAIRING:
+      if (isHosting && millis() - lastNetworkSend > 1000) {
+        lastNetworkSend = millis();
+        GamePacket pkt; pkt.type = MSG_PAIR_REQ;
+        esp_now_send(broadcastMAC, (uint8_t*)&pkt, sizeof(GamePacket));
+      }
+      break;
+
+    case STATE_PLACE_SHIPS: {
+      uint8_t shipLen = myShips[currentShipToPlace].length;
+      uint8_t maxX = placementHorizontal ? (8 - shipLen) : 7;
+      uint8_t maxY = placementHorizontal ? 7 : (8 - shipLen);
+
+      if (moveX != 0) placementX = constrain(placementX + moveX, 0, maxX);
+      if (moveY != 0) placementY = constrain(placementY + moveY, 0, maxY);
+
+      if (btn == BTN_SHORT_CLICK) {
+        placementHorizontal = !placementHorizontal;
+        maxX = placementHorizontal ? (8 - shipLen) : 7;
+        maxY = placementHorizontal ? 7 : (8 - shipLen);
+        if (placementX > maxX) placementX = maxX;
+        if (placementY > maxY) placementY = maxY;
+      }
+      else if (btn == BTN_LONG_PRESS) {
+        if (isValidPlacement(currentShipToPlace, placementX, placementY, placementHorizontal)) {
+          placeShip(currentShipToPlace, placementX, placementY, placementHorizontal);
+          currentShipToPlace++;
+          
+          if (currentShipToPlace >= 3) {
+            if (!isHost) {
+              GamePacket pkt; pkt.type = MSG_READY;
+              esp_now_send(opponentMAC, (uint8_t*)&pkt, sizeof(GamePacket));
+              gameState = STATE_WAITING_OPPONENT; lastNetworkSend = 0;
+            } else {
+              if (opponentReady) {
+                GamePacket pkt; pkt.type = MSG_GAME_START;
+                esp_now_send(opponentMAC, (uint8_t*)&pkt, sizeof(GamePacket));
+                gameState = STATE_GAME_PLAY; playSubState = MY_TURN;
+                showPopup("GAME ON! YOUR TURN", C_GREEN, 2000);
+              } else {
+                gameState = STATE_WAITING_OPPONENT; lastNetworkSend = 0;
+              }
+            }
+          } else {
+            placementX = 0; placementY = 0; placementHorizontal = true;
+          }
+        } else {
+          showPopup("INVALID!", C_RED, 800);
+        }
+      }
+      break;
+    }
+
+    case STATE_WAITING_OPPONENT:
+      if (millis() - lastNetworkSend > 1000) {
+        lastNetworkSend = millis();
+        if (!isHost) {
+          GamePacket pkt; pkt.type = MSG_READY;
+          esp_now_send(opponentMAC, (uint8_t*)&pkt, sizeof(GamePacket));
+        } else {
+          if (opponentReady) {
+            GamePacket pkt; pkt.type = MSG_GAME_START;
+            esp_now_send(opponentMAC, (uint8_t*)&pkt, sizeof(GamePacket));
+          }
+        }
+      }
+      break;
+
+    case STATE_GAME_PLAY:
+      if (playSubState == MY_TURN) {
+        if (moveX != 0) targetX = constrain(targetX + moveX, 0, 7);
+        if (moveY != 0) targetY = constrain(targetY + moveY, 0, 7);
+
+        if (btn == BTN_SHORT_CLICK) {
+          if (opponentGrid[targetY][targetX] == 0) {
+            myShotID++; // Generate unique Sequence ID for this turn
+            GamePacket pkt; pkt.type = MSG_FIRE; pkt.x = targetX; pkt.y = targetY; pkt.seqNum = myShotID;
+            esp_now_send(opponentMAC, (uint8_t*)&pkt, sizeof(GamePacket));
+            playSubState = WAIT_RESULT;
+            shotSentTime = millis();
+          } else showPopup("ALREADY SHOT!", C_ORANGE, 1000);
+        }
+      } 
+      // Desync Recovery: If result packet dropped, resend exactly the same ID.
+      else if (playSubState == WAIT_RESULT) {
+        if (millis() - shotSentTime > 3000) {
+           showPopup("RESENDING...", C_ORANGE, 1500);
+           GamePacket pkt; pkt.type = MSG_FIRE; pkt.x = targetX; pkt.y = targetY; pkt.seqNum = myShotID;
+           esp_now_send(opponentMAC, (uint8_t*)&pkt, sizeof(GamePacket));
+           shotSentTime = millis(); 
+        }
+      }
+      break;
+
+    case STATE_GAME_OVER:
+      if (btn == BTN_SHORT_CLICK || btn == BTN_LONG_PRESS) {
+        GamePacket pkt; pkt.type = MSG_RESET;
+        esp_now_send(opponentMAC, (uint8_t*)&pkt, sizeof(GamePacket));
+        resetGame();
+      }
+      break;
+  }
+  drawScreen();
+  delay(16); 
+}
+
+// --- GRAPHICS RENDERING ---
+void drawGridOutline(int startX, int startY, const char* label) {
+  canvas.setTextSize(1); canvas.setTextColor(C_WHITE);
+  canvas.setCursor(startX + 2, startY - 9); canvas.print(label);
+
+  for (int r = 0; r <= 8; r++) {
+    canvas.drawLine(startX, startY + r * GRID_CELL_SIZE, startX + 8 * GRID_CELL_SIZE, startY + r * GRID_CELL_SIZE, rgb(40, 40, 100));
+    canvas.drawLine(startX + r * GRID_CELL_SIZE, startY, startX + r * GRID_CELL_SIZE, startY + 8 * GRID_CELL_SIZE, rgb(40, 40, 100));
+  }
+}
+
+void drawGridContents(int startX, int startY, uint8_t grid[8][8], bool isEnemy) {
+  for (int r = 0; r < 8; r++) {
+    for (int c = 0; c < 8; c++) {
+      int cx = startX + c * GRID_CELL_SIZE;
+      int cy = startY + r * GRID_CELL_SIZE;
+      uint8_t val = grid[r][c];
+
+      if (isEnemy) {
+        if (val == 1) canvas.fillCircle(cx + GRID_CELL_SIZE/2, cy + GRID_CELL_SIZE/2, 2, C_WHITE);
+        else if (val == 2) {
+          canvas.drawLine(cx + 1, cy + 1, cx + GRID_CELL_SIZE - 2, cy + GRID_CELL_SIZE - 2, C_RED);
+          canvas.drawLine(cx + GRID_CELL_SIZE - 2, cy + 1, cx + 1, cy + GRID_CELL_SIZE - 2, C_RED);
+        }
+        else if (val == 3) canvas.fillRect(cx + 1, cy + 1, GRID_CELL_SIZE - 1, GRID_CELL_SIZE - 1, rgb(150, 0, 0));
+      } else {
+        if (val >= 1 && val <= 3) canvas.fillRect(cx + 1, cy + 1, GRID_CELL_SIZE - 1, GRID_CELL_SIZE - 1, rgb(100, 100, 100));
+        else if (val == 10) {
+          canvas.fillRect(cx + 1, cy + 1, GRID_CELL_SIZE - 1, GRID_CELL_SIZE - 1, rgb(80, 20, 20));
+          canvas.drawLine(cx + 1, cy + 1, cx + GRID_CELL_SIZE - 2, cy + GRID_CELL_SIZE - 2, C_RED);
+          canvas.drawLine(cx + GRID_CELL_SIZE - 2, cy + 1, cx + 1, cy + GRID_CELL_SIZE - 2, C_RED);
+        } else if (val == 11) canvas.fillCircle(cx + GRID_CELL_SIZE/2, cy + GRID_CELL_SIZE/2, 2, C_LIGHTGREY);
+      }
+    }
+  }
+}
+
+void drawCandidateShip(int startX, int startY, uint8_t shipIdx, uint8_t x, uint8_t y, bool horizontal) {
+  uint8_t len = myShips[shipIdx].length;
+  bool valid = isValidPlacement(shipIdx, x, y, horizontal);
+  uint16_t color = valid ? C_GREEN : C_RED;
+
+  if ((millis() / 200) % 2 == 0) {
+    for (int i = 0; i < len; i++) {
+      int cx = startX + (horizontal ? (x + i) : x) * GRID_CELL_SIZE;
+      int cy = startY + (horizontal ? y : (y + i)) * GRID_CELL_SIZE;
+      canvas.drawRect(cx + 1, cy + 1, GRID_CELL_SIZE - 1, GRID_CELL_SIZE - 1, color);
+    }
+  }
+}
+
+void drawTargetCursor(int startX, int startY, uint8_t x, uint8_t y) {
+  int cx = startX + x * GRID_CELL_SIZE;
+  int cy = startY + y * GRID_CELL_SIZE;
+  uint16_t color = ((millis() / 150) % 2 == 0) ? C_RED : C_WHITE;
+  
+  canvas.drawFastHLine(cx, cy, 3, color);
+  canvas.drawFastVLine(cx, cy, 3, color);
+  canvas.drawFastHLine(cx + GRID_CELL_SIZE - 3, cy, 3, color);
+  canvas.drawFastVLine(cx + GRID_CELL_SIZE - 1, cy, 3, color);
+  canvas.drawFastHLine(cx, cy + GRID_CELL_SIZE - 1, 3, color);
+  canvas.drawFastVLine(cx, cy + GRID_CELL_SIZE - 3, 3, color);
+  canvas.drawFastHLine(cx + GRID_CELL_SIZE - 3, cy + GRID_CELL_SIZE - 1, 3, color);
+  canvas.drawFastVLine(cx + GRID_CELL_SIZE - 1, cy + GRID_CELL_SIZE - 3, 3, color);
+}
+
+void drawScreen() {
+  canvas.fillScreen(C_BLACK);
+
+  // Header Banner
+  canvas.fillRect(0, 0, SCREEN_W, 12, rgb(20, 30, 60));
+  canvas.drawFastHLine(0, 12, SCREEN_W, C_CYAN);
+  canvas.setTextSize(1); canvas.setTextColor(C_CYAN);
+  canvas.setCursor(50, 2); canvas.print("BATTLESHIP");
+
+  switch (gameState) {
+    case STATE_MENU: {
+      canvas.setTextSize(1); canvas.setTextColor(C_YELLOW);
+      canvas.setCursor(41, 40); canvas.print("READY TO PLAY");
+      
+      canvas.setTextColor(C_WHITE); 
+      canvas.setCursor(20, 70); canvas.print("Short Click: JOIN");
+      canvas.setCursor(20, 90); canvas.print("Hold Button: HOST");
+      break;
+    }
+
+    case STATE_PAIRING: {
+      canvas.setTextSize(1); canvas.setTextColor(C_WHITE);
+      canvas.setCursor(15, 30); canvas.print(isHosting ? "Hosting Game..." : "Joining Game...");
+      canvas.setCursor(20, 110); canvas.print("Turn on other board!");
+      
+      static float radarAngle = 0;
+      int rx = SCREEN_W / 2, ry = 70, rRadius = 25;
+      canvas.drawCircle(rx, ry, rRadius, C_GREEN);
+      canvas.drawCircle(rx, ry, 2, C_GREEN);
+      radarAngle += 0.08;
+      if (radarAngle >= 2 * PI) radarAngle -= 2 * PI;
+      canvas.drawLine(rx, ry, rx + rRadius * cos(radarAngle), ry + rRadius * sin(radarAngle), C_GREEN);
+      break;
+    }
+
+    case STATE_PLACE_SHIPS: {
+      drawGridOutline(MY_GRID_X, MY_GRID_Y, "YOUR FLEET");
+      drawGridContents(MY_GRID_X, MY_GRID_Y, myGrid, false);
+      drawCandidateShip(MY_GRID_X, MY_GRID_Y, currentShipToPlace, placementX, placementY, placementHorizontal);
+
+      int txtX = 84; 
+      canvas.setTextSize(1); canvas.setTextColor(C_WHITE);
+      canvas.setCursor(txtX, MY_GRID_Y + 5);      canvas.printf("SHIP: %d/3", currentShipToPlace + 1);
+      canvas.setCursor(txtX, MY_GRID_Y + 20);     canvas.printf("SIZE: %d px", myShips[currentShipToPlace].length);
+      canvas.setTextColor(C_YELLOW);
+      canvas.setCursor(txtX, MY_GRID_Y + 42);     canvas.print("Click: Flip");
+      canvas.setCursor(txtX, MY_GRID_Y + 57);     canvas.print("Hold: Place");
+      break;
+    }
+
+    case STATE_WAITING_OPPONENT: {
+      drawGridOutline(MY_GRID_X, MY_GRID_Y, "YOUR FLEET");
+      drawGridContents(MY_GRID_X, MY_GRID_Y, myGrid, false);
+
+      int txtX = 84; canvas.setTextSize(1);
+      canvas.setTextColor(C_GREEN); canvas.setCursor(txtX, MY_GRID_Y + 10); canvas.print("DEPLOYED!");
+      canvas.setTextColor(C_WHITE); canvas.setCursor(txtX, MY_GRID_Y + 30); 
+      canvas.print(isHost ? "Waiting P2" : "Waiting Host");
+      
+      int progressDots = (millis() / 500) % 4;
+      canvas.setCursor(txtX, MY_GRID_Y + 50); canvas.print("Linking");
+      for (int i = 0; i < progressDots; i++) canvas.print(".");
+      break;
+    }
+
+    case STATE_GAME_PLAY: {
+      drawGridOutline(MY_GRID_X, MY_GRID_Y, "YOU");
+      drawGridContents(MY_GRID_X, MY_GRID_Y, myGrid, false);
+      
+      drawGridOutline(ENEMY_GRID_X, ENEMY_GRID_Y, "FOE");
+      drawGridContents(ENEMY_GRID_X, ENEMY_GRID_Y, opponentGrid, true);
+
+      if (playSubState == MY_TURN) drawTargetCursor(ENEMY_GRID_X, ENEMY_GRID_Y, targetX, targetY);
+
+      canvas.setTextSize(1); canvas.setTextColor(C_WHITE);
+      canvas.setCursor(MY_GRID_X, MY_GRID_Y + 76); canvas.printf("Left:%d", 3 - getMySunkCount());
+      canvas.setCursor(ENEMY_GRID_X, ENEMY_GRID_Y + 76); canvas.printf("Left:%d", 3 - opponentShipsSunkCount);
+
+      canvas.setCursor(2, 114);
+      if (playSubState == MY_TURN) {
+        canvas.setTextColor(C_GREEN); canvas.print("YOUR TURN: Aim & Click");
+      } else if (playSubState == WAIT_RESULT) {
+        canvas.setTextColor(C_YELLOW); canvas.print("FIRING...");
+      } else {
+        canvas.setTextColor(C_RED); canvas.print("ENEMY TURN: Bracing...");
+      }
+      break;
+    }
+
+    case STATE_GAME_OVER: {
+      canvas.setTextSize(2);
+      if (isWinner) {
+        canvas.setTextColor(C_GREEN); canvas.setCursor(38, 40); canvas.print("VICTORY");
+      } else {
+        canvas.setTextColor(C_RED); canvas.setCursor(44, 40); canvas.print("DEFEAT");
+      }
+      canvas.setTextSize(1); canvas.setTextColor(C_WHITE);
+      canvas.setCursor(17, 90); canvas.print("CLICK BUTTON TO RESET");
+      break;
+    }
+  }
+
+  // Draw Popup Override if active
+  if (millis() < popupEndTime) {
+    int pw = 140, ph = 26;
+    int px = (SCREEN_W - pw) / 2, py = (SCREEN_H - ph) / 2;
+    canvas.fillRoundRect(px, py, pw, ph, 4, rgb(15, 20, 45));
+    canvas.drawRoundRect(px, py, pw, ph, 4, popupColor);
+    canvas.setTextSize(1); canvas.setTextColor(popupColor);
+    int textX = px + (pw - (popupText.length() * 6)) / 2;
+    int textY = py + (ph - 8) / 2;
+    canvas.setCursor(textX, textY);
+    canvas.print(popupText);
+  }
+
+  tft.drawRGBBitmap(0, 0, canvas.getBuffer(), SCREEN_W, SCREEN_H);
+}
+
+// --- UTILITIES ---
+void showPopup(String text, uint16_t color, unsigned long duration) {
+  popupText = text; popupColor = color; popupEndTime = millis() + duration;
+}
+
+void resetGame() {
+  memset(myGrid, 0, sizeof(myGrid));
+  memset(opponentGrid, 0, sizeof(opponentGrid));
+
+  for (int i = 0; i < 3; i++) {
+    myShips[i].placed = false; myShips[i].x = 0; myShips[i].y = 0; myShips[i].horizontal = true;
+  }
+  
+  isHost = false; isHosting = false;
+  currentShipToPlace = 0; opponentReady = false; opponentShipsSunkCount = 0;
+  placementX = 0; placementY = 0; placementHorizontal = true; targetX = 0; targetY = 0;
+  
+  myShotID = 1; lastOpponentShotID = 0; lastOpponentShotResult = 0;
+  lastNetworkSend = 0; shotSentTime = 0;
+  
+  gameState = STATE_MENU; showPopup("SYSTEM ARMED", C_CYAN, 1200);
+}
+
+bool isValidPlacement(uint8_t shipIdx, uint8_t x, uint8_t y, bool horizontal) {
+  uint8_t len = myShips[shipIdx].length;
+  if (horizontal) {
+    if (x + len > 8) return false;
+    for (uint8_t i = 0; i < len; i++) if (myGrid[y][x + i] != 0) return false;
+  } else {
+    if (y + len > 8) return false;
+    for (uint8_t i = 0; i < len; i++) if (myGrid[y + i][x] != 0) return false;
+  }
+  return true;
+}
+
+void placeShip(uint8_t shipIdx, uint8_t x, uint8_t y, bool horizontal) {
+  uint8_t len = myShips[shipIdx].length;
+  myShips[shipIdx].x = x; myShips[shipIdx].y = y;
+  myShips[shipIdx].horizontal = horizontal; myShips[shipIdx].placed = true;
+  for (uint8_t i = 0; i < len; i++) {
+    uint8_t cx = horizontal ? (x + i) : x; uint8_t cy = horizontal ? y : (y + i);
+    myGrid[cy][cx] = shipIdx + 1;
+  }
+}
+
+bool isShipSunk(uint8_t shipIdx) {
+  uint8_t len = myShips[shipIdx].length;
+  uint8_t sx = myShips[shipIdx].x; uint8_t sy = myShips[shipIdx].y;
+  bool horiz = myShips[shipIdx].horizontal;
+  for (uint8_t i = 0; i < len; i++) {
+    uint8_t cx = horiz ? (sx + i) : sx; uint8_t cy = horiz ? sy : (sy + i);
+    if (myGrid[cy][cx] != 10) return false; 
+  }
+  return true;
+}
+
+bool areAllMyShipsSunk() {
+  for (uint8_t i = 0; i < 3; i++) if (!isShipSunk(i)) return false;
+  return true;
+}
+
+uint8_t getMySunkCount() {
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < 3; i++) if (isShipSunk(i)) count++;
+  return count;
+}
+
+void addSpecificPeer(const uint8_t *mac) {
+  if (peerAdded) esp_now_del_peer(opponentMAC);
+  memcpy(opponentMAC, mac, 6);
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, opponentMAC, 6);
+  peerInfo.channel = 1; peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) == ESP_OK) peerAdded = true;
+}
